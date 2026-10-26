@@ -1,0 +1,10 @@
+# Per-installation configuration and runtime data
+config/sites.json
+config/notifications.env
+state.json
+*.log
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+.venv/

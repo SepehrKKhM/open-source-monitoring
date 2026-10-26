@@ -1,0 +1,14 @@
+{
+  "timeout_seconds": 10,
+  "failure_threshold": 2,
+  "sites": [
+    {
+      "name": "example-site-1",
+      "url": "https://example.com"
+    },
+    {
+      "name": "example-site-2",
+      "url": "https://example.org"
+    }
+  ]
+}

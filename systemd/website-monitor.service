@@ -1,0 +1,21 @@
+[Unit]
+Description=Check configured websites
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=website-monitor
+Group=website-monitor
+WorkingDirectory=/opt/open-source-monitoring
+ExecStart=/usr/bin/python3 /opt/open-source-monitoring/monitor.py
+Environment=WEBSITE_MONITOR_STATE_FILE=/var/lib/website-monitor/state.json
+EnvironmentFile=/etc/website-monitor/notifications.env
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/website-monitor
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
