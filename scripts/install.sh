@@ -26,6 +26,11 @@ for required_command in python3 curl systemctl runuser; do
   fi
 done
 
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
+  echo "Python 3.10 or newer is required." >&2
+  exit 1
+fi
+
 for required_file in \
   "${SOURCE_ROOT}/monitor.py" \
   "${SOURCE_ROOT}/systemd/website-monitor.service" \
@@ -46,13 +51,42 @@ if [[ ! -r "${SOURCE_NOTIFICATIONS}" && ! -r "${INSTALLED_NOTIFICATIONS}" ]]; th
 fi
 
 SITES_TO_VALIDATE="${SOURCE_SITES}"
-if [[ ! -r "${SITES_TO_VALIDATE}" ]]; then
+if [[ -r "${INSTALLED_SITES}" ]]; then
   SITES_TO_VALIDATE="${INSTALLED_SITES}"
 fi
-python3 -m json.tool "${SITES_TO_VALIDATE}" >/dev/null || {
-  echo "Site configuration is not valid JSON: ${SITES_TO_VALIDATE}" >&2
-  exit 1
-}
+PYTHONPATH="${SOURCE_ROOT}" PYTHONDONTWRITEBYTECODE=1 \
+  python3 - "${SITES_TO_VALIDATE}" <<'PY'
+import sys
+from pathlib import Path
+
+import monitor
+
+monitor.CONFIG_PATH = Path(sys.argv[1])
+try:
+    monitor.load_config()
+except ValueError as exc:
+    print(f"Invalid site configuration: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+
+NOTIFICATIONS_TO_VALIDATE="${SOURCE_NOTIFICATIONS}"
+if [[ -r "${INSTALLED_NOTIFICATIONS}" ]]; then
+  NOTIFICATIONS_TO_VALIDATE="${INSTALLED_NOTIFICATIONS}"
+fi
+PYTHONPATH="${SOURCE_ROOT}" PYTHONDONTWRITEBYTECODE=1 \
+  python3 - "${NOTIFICATIONS_TO_VALIDATE}" <<'PY'
+import sys
+from pathlib import Path
+
+import monitor
+
+try:
+    settings = monitor.load_notification_settings(Path(sys.argv[1]))
+    monitor.validate_email_settings(settings)
+except ValueError as exc:
+    print(f"Invalid SMTP settings: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
 
 if ! getent group "${SERVICE_GROUP}" >/dev/null; then
   groupadd --system "${SERVICE_GROUP}"
@@ -91,7 +125,6 @@ install -o root -g root -m 0644 \
 
 runuser -u "${SERVICE_USER}" -- test -r "${INSTALL_ROOT}/monitor.py"
 runuser -u "${SERVICE_USER}" -- test -r "${INSTALLED_SITES}"
-python3 -m json.tool "${INSTALLED_SITES}" >/dev/null
 
 systemctl daemon-reload
 systemctl enable --now website-monitor.timer

@@ -163,6 +163,78 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(current["consecutive_failures"], 0)
         self.assertEqual(event, "recovery")
 
+    def test_pending_down_event_is_not_queued_twice(self):
+        previous = {
+            "consecutive_failures": 2,
+            "alerted_down": False,
+            "pending_notifications": [{"event": "down", "result": {"detail": "DNS lookup failed"}}],
+        }
+        _, event = monitor.transition(previous, healthy=False, threshold=2)
+        self.assertIsNone(event)
+
+    def test_success_after_pending_down_queues_recovery(self):
+        previous = {
+            "consecutive_failures": 2,
+            "alerted_down": False,
+            "pending_notifications": [{"event": "down", "result": {"detail": "DNS lookup failed"}}],
+        }
+        _, event = monitor.transition(previous, healthy=True, threshold=2)
+        self.assertEqual(event, "recovery")
+
+    def test_pending_down_is_retried_before_recovery_event(self):
+        self.write_config(self.config())
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "sites": {
+                        "site-a": {
+                            "consecutive_failures": 2,
+                            "alerted_down": False,
+                            "pending_notifications": [
+                                {
+                                    "event": "down",
+                                    "result": {
+                                        "detail": "DNS lookup failed",
+                                        "http_status": "000",
+                                        "redirects": 0,
+                                        "final_host": "example.com",
+                                        "consecutive_failures": 2,
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        delivered = []
+        healthy_result = {
+            "healthy": True,
+            "detail": "HTTP 200",
+            "http_status": "200",
+            "redirects": 0,
+            "final_host": "example.com",
+        }
+        with (
+            mock.patch.object(monitor.shutil, "which", return_value="/usr/bin/curl"),
+            mock.patch.object(monitor, "check_site", return_value=healthy_result),
+            mock.patch.object(
+                monitor,
+                "send_email",
+                side_effect=lambda site, event, result: delivered.append((event, result["detail"])),
+            ),
+        ):
+            self.assertEqual(monitor.main(), 0)
+
+        self.assertEqual(
+            delivered,
+            [("down", "DNS lookup failed"), ("recovery", "HTTP 200")],
+        )
+        final_state = monitor.load_state()["site-a"]
+        self.assertFalse(final_state["alerted_down"])
+        self.assertEqual(final_state["pending_notifications"], [])
+
     def test_healthy_site_without_down_alert_does_not_recover(self):
         _, event = monitor.transition(
             {"consecutive_failures": 1, "alerted_down": False}, healthy=True, threshold=2
@@ -184,6 +256,59 @@ class MonitorTests(unittest.TestCase):
         with mock.patch.dict(os.environ, values, clear=True):
             with self.assertRaisesRegex(ValueError, "set together"):
                 monitor.send_email("site-a", "down", {"detail": "DNS lookup failed"})
+
+    def test_load_and_validate_complete_notification_file(self):
+        path = self.root / "notifications.env"
+        path.write_text(
+            "# SMTP settings\n"
+            "SMTP_HOST=smtp.example.com\n"
+            "SMTP_PORT=587\n"
+            "SMTP_SECURITY=starttls\n"
+            "SMTP_USERNAME=monitor@example.com\n"
+            "SMTP_PASSWORD=app-password=with-equals\n"
+            "EMAIL_FROM=monitor@example.com\n"
+            "EMAIL_TO=alerts@example.net\n",
+            encoding="utf-8",
+        )
+
+        settings = monitor.load_notification_settings(path)
+        validated = monitor.validate_email_settings(settings)
+        self.assertEqual(validated["SMTP_PORT"], 587)
+        self.assertEqual(validated["SMTP_SECURITY"], "starttls")
+        self.assertEqual(validated["SMTP_PASSWORD"], "app-password=with-equals")
+
+    def test_notification_file_rejects_missing_required_values(self):
+        path = self.root / "notifications.env"
+        path.write_text(
+            "SMTP_HOST=smtp.example.com\nEMAIL_FROM=\nEMAIL_TO=alerts@example.net\n",
+            encoding="utf-8",
+        )
+        settings = monitor.load_notification_settings(path)
+        with self.assertRaisesRegex(ValueError, "EMAIL_FROM"):
+            monitor.validate_email_settings(settings)
+
+    def test_notification_file_rejects_invalid_security_and_port(self):
+        base = {
+            "SMTP_HOST": "smtp.example.com",
+            "EMAIL_FROM": "monitor@example.com",
+            "EMAIL_TO": "alerts@example.net",
+        }
+        for values in (
+            {**base, "SMTP_SECURITY": "plain"},
+            {**base, "SMTP_PORT": "not-a-port"},
+            {**base, "SMTP_PORT": "70000"},
+        ):
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError):
+                    monitor.validate_email_settings(values)
+
+    def test_environment_file_parser_does_not_evaluate_shell_syntax(self):
+        path = self.root / "notifications.env"
+        path.write_text("SMTP_PASSWORD=$(echo should-not-run)\n", encoding="utf-8")
+        self.assertEqual(
+            monitor.load_notification_settings(path)["SMTP_PASSWORD"],
+            "$(echo should-not-run)",
+        )
 
 
 if __name__ == "__main__":

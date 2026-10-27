@@ -7,12 +7,14 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import smtplib
 import ssl
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from email.message import EmailMessage
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -119,9 +121,51 @@ def load_state() -> dict[str, dict[str, object]]:
         failures = item.get("consecutive_failures", 0)
         if isinstance(failures, bool) or not isinstance(failures, int) or failures < 0:
             failures = 0
+        pending_notifications = []
+        raw_pending = item.get("pending_notifications", [])
+        if isinstance(raw_pending, list):
+            for notification in raw_pending:
+                if not isinstance(notification, dict):
+                    continue
+                event = notification.get("event")
+                result = notification.get("result")
+                if event not in ("down", "recovery") or not isinstance(result, dict):
+                    continue
+                detail = result.get("detail", "Unknown result")
+                status = result.get("http_status", "")
+                redirects = result.get("redirects", 0)
+                event_failures = result.get("consecutive_failures", failures)
+                final_host = result.get("final_host", "unknown")
+                if not isinstance(detail, str):
+                    detail = "Unknown result"
+                if not isinstance(status, str):
+                    status = ""
+                if isinstance(redirects, bool) or not isinstance(redirects, int) or redirects < 0:
+                    redirects = 0
+                if (
+                    isinstance(event_failures, bool)
+                    or not isinstance(event_failures, int)
+                    or event_failures < 0
+                ):
+                    event_failures = failures
+                if not isinstance(final_host, str):
+                    final_host = "unknown"
+                pending_notifications.append(
+                    {
+                        "event": event,
+                        "result": {
+                            "detail": detail[:500],
+                            "http_status": status[:16],
+                            "redirects": redirects,
+                            "final_host": final_host[:253],
+                            "consecutive_failures": event_failures,
+                        },
+                    }
+                )
         state[name] = {
             "consecutive_failures": failures,
             "alerted_down": item.get("alerted_down") is True,
+            "pending_notifications": pending_notifications,
         }
     return state
 
@@ -150,6 +194,74 @@ def safe_host(url: str) -> str:
         return urlsplit(url).hostname or "unknown"
     except ValueError:
         return "unknown"
+
+
+def load_notification_settings(path: Path) -> dict[str, str]:
+    """Read simple KEY=VALUE SMTP settings without evaluating shell code."""
+    settings: dict[str, str] = {}
+    try:
+        with path.open(encoding="utf-8") as settings_file:
+            for line_number, raw_line in enumerate(settings_file, start=1):
+                line = raw_line.strip()
+                if not line or line.startswith(("#", ";")):
+                    continue
+                if "=" not in line:
+                    raise ValueError(
+                        f"Invalid SMTP settings line {line_number}: expected KEY=VALUE"
+                    )
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                    raise ValueError(
+                        f"Invalid SMTP settings line {line_number}: invalid variable name"
+                    )
+                if value.startswith(("'", '"')):
+                    quote = value[0]
+                    if len(value) < 2 or value[-1] != quote:
+                        raise ValueError(
+                            f"Invalid SMTP settings line {line_number}: unmatched quote"
+                        )
+                    value = value[1:-1]
+                settings[key] = value
+    except OSError as exc:
+        raise ValueError(f"Cannot read SMTP settings file {path}: {exc}") from exc
+    return settings
+
+
+def validate_email_settings(settings: Mapping[str, str]) -> dict[str, str | int]:
+    """Validate SMTP values and return normalized settings without secrets in errors."""
+    required = ("SMTP_HOST", "EMAIL_FROM", "EMAIL_TO")
+    missing = [key for key in required if not settings.get(key, "").strip()]
+    if missing:
+        raise ValueError(f"Missing email settings: {', '.join(missing)}")
+
+    security = settings.get("SMTP_SECURITY", "starttls").strip().lower()
+    if security not in {"starttls", "ssl"}:
+        raise ValueError("SMTP_SECURITY must be 'starttls' or 'ssl'")
+    default_port = "587" if security == "starttls" else "465"
+    raw_port = settings.get("SMTP_PORT", default_port).strip()
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise ValueError("SMTP_PORT must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("SMTP_PORT must be between 1 and 65535")
+
+    username = settings.get("SMTP_USERNAME", "")
+    password = settings.get("SMTP_PASSWORD", "")
+    if bool(username) != bool(password):
+        raise ValueError("SMTP_USERNAME and SMTP_PASSWORD must be set together")
+
+    return {
+        "SMTP_HOST": settings["SMTP_HOST"].strip(),
+        "SMTP_PORT": port,
+        "SMTP_SECURITY": security,
+        "SMTP_USERNAME": username,
+        "SMTP_PASSWORD": password,
+        "EMAIL_FROM": settings["EMAIL_FROM"].strip(),
+        "EMAIL_TO": settings["EMAIL_TO"].strip(),
+    }
 
 
 def check_site(site: dict[str, str], timeout: float) -> dict[str, object]:
@@ -229,30 +341,15 @@ def check_site(site: dict[str, str], timeout: float) -> dict[str, object]:
 
 def send_email(site_name: str, event: str, result: dict[str, object]) -> None:
     """Send one DOWN or RECOVERY message using SMTP environment settings."""
-    required = ("SMTP_HOST", "EMAIL_FROM", "EMAIL_TO")
-    missing = [key for key in required if not os.environ.get(key)]
-    if missing:
-        raise ValueError(f"Missing email settings: {', '.join(missing)}")
-
-    security = os.environ.get("SMTP_SECURITY", "starttls").lower()
-    if security not in {"starttls", "ssl"}:
-        raise ValueError("SMTP_SECURITY must be 'starttls' or 'ssl'")
-    default_port = "587" if security == "starttls" else "465"
-    try:
-        port = int(os.environ.get("SMTP_PORT", default_port))
-    except ValueError as exc:
-        raise ValueError("SMTP_PORT must be an integer") from exc
-    if not 1 <= port <= 65535:
-        raise ValueError("SMTP_PORT must be between 1 and 65535")
-
-    username = os.environ.get("SMTP_USERNAME", "")
-    password = os.environ.get("SMTP_PASSWORD", "")
-    if bool(username) != bool(password):
-        raise ValueError("SMTP_USERNAME and SMTP_PASSWORD must be set together")
+    settings = validate_email_settings(os.environ)
+    security = settings["SMTP_SECURITY"]
+    port = settings["SMTP_PORT"]
+    username = settings["SMTP_USERNAME"]
+    password = settings["SMTP_PASSWORD"]
 
     message = EmailMessage()
-    message["From"] = os.environ["EMAIL_FROM"]
-    message["To"] = os.environ["EMAIL_TO"]
+    message["From"] = settings["EMAIL_FROM"]
+    message["To"] = settings["EMAIL_TO"]
     message["Subject"] = f"Website {event}: {site_name}"
 
     redirect_note = ""
@@ -279,13 +376,13 @@ def send_email(site_name: str, event: str, result: dict[str, object]) -> None:
     context = ssl.create_default_context()
     if security == "ssl":
         with smtplib.SMTP_SSL(
-            host=os.environ["SMTP_HOST"], port=port, timeout=15, context=context
+            host=settings["SMTP_HOST"], port=port, timeout=15, context=context
         ) as client:
             if username:
                 client.login(username, password)
             client.send_message(message)
     else:
-        with smtplib.SMTP(host=os.environ["SMTP_HOST"], port=port, timeout=15) as client:
+        with smtplib.SMTP(host=settings["SMTP_HOST"], port=port, timeout=15) as client:
             client.ehlo()
             client.starttls(context=context)
             client.ehlo()
@@ -302,14 +399,28 @@ def transition(
     if isinstance(failures, bool) or not isinstance(failures, int) or failures < 0:
         failures = 0
     alerted_down = previous.get("alerted_down") is True
+    pending_notifications = previous.get("pending_notifications", [])
+    logical_down = alerted_down
+    if isinstance(pending_notifications, list) and pending_notifications:
+        latest = pending_notifications[-1]
+        if isinstance(latest, dict) and latest.get("event") in ("down", "recovery"):
+            logical_down = latest["event"] == "down"
 
     if healthy:
-        event = "recovery" if alerted_down else None
-        return {"consecutive_failures": 0, "alerted_down": alerted_down}, event
+        event = "recovery" if logical_down else None
+        return {
+            "consecutive_failures": 0,
+            "alerted_down": alerted_down,
+            "pending_notifications": pending_notifications,
+        }, event
 
     failures += 1
-    event = "down" if failures >= threshold and not alerted_down else None
-    return {"consecutive_failures": failures, "alerted_down": alerted_down}, event
+    event = "down" if failures >= threshold and not logical_down else None
+    return {
+        "consecutive_failures": failures,
+        "alerted_down": alerted_down,
+        "pending_notifications": pending_notifications,
+    }, event
 
 
 def main() -> int:
@@ -343,16 +454,29 @@ def main() -> int:
         LOGGER.info("%s: %s (%s)", site["name"], "UP" if healthy else "check failed", result["detail"])
 
         current, event = transition(state.get(site["name"], {}), healthy, threshold)
+        pending_notifications = list(current["pending_notifications"])
+        if event:
+            event_result = {
+                "detail": result["detail"],
+                "http_status": result.get("http_status", ""),
+                "redirects": redirects,
+                "final_host": final_host,
+                "consecutive_failures": current["consecutive_failures"],
+            }
+            pending_notifications.append({"event": event, "result": event_result})
+        current["pending_notifications"] = pending_notifications
         state[site["name"]] = current
         try:
             save_state(state)
-            if event:
-                email_result = dict(result)
-                email_result["consecutive_failures"] = current["consecutive_failures"]
-                send_email(site["name"], event, email_result)
-                current["alerted_down"] = event == "down"
+            while pending_notifications:
+                notification = pending_notifications[0]
+                notification_event = notification["event"]
+                send_email(site["name"], notification_event, notification["result"])
+                current["alerted_down"] = notification_event == "down"
+                pending_notifications = pending_notifications[1:]
+                current["pending_notifications"] = pending_notifications
                 save_state(state)
-                LOGGER.info("%s email sent for %s", site["name"], event)
+                LOGGER.info("%s email sent for %s", site["name"], notification_event)
         except (OSError, ValueError, smtplib.SMTPException) as exc:
             LOGGER.error("%s notification/state error: %s", site["name"], exc)
             run_error = True
