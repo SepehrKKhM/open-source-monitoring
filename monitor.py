@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check configured websites and email on confirmed outages and recovery."""
+"""Check configured websites and notify independent channels on state changes."""
 
 from __future__ import annotations
 
@@ -9,14 +9,19 @@ import math
 import os
 import re
 import shutil
+import socket
 import smtplib
 import ssl
 import subprocess
 import sys
 import tempfile
+import uuid
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib.parse import urlsplit
 
 
@@ -102,7 +107,7 @@ def load_config() -> tuple[list[dict[str, str]], float, int]:
 
 
 def load_state() -> dict[str, dict[str, object]]:
-    """Load consecutive failure counters and notification state."""
+    """Load site state and migrate legacy email-only queue entries."""
     try:
         with STATE_PATH.open(encoding="utf-8") as state_file:
             raw_state = json.load(state_file)
@@ -150,9 +155,52 @@ def load_state() -> dict[str, dict[str, object]]:
                     event_failures = failures
                 if not isinstance(final_host, str):
                     final_host = "unknown"
+                event_id = notification.get("event_id")
+                try:
+                    event_id = str(uuid.UUID(event_id))
+                except (ValueError, TypeError, AttributeError):
+                    event_id = str(uuid.uuid4())
+                timestamp = notification.get("timestamp")
+                if not isinstance(timestamp, str) or not timestamp.strip():
+                    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                server = notification.get("server", "")
+                if not isinstance(server, str) or not server.strip():
+                    server = socket.gethostname() or "unknown"
+                service = notification.get("service", name)
+                if not isinstance(service, str) or not service.strip():
+                    service = name
+                severity = notification.get(
+                    "severity", "CRITICAL" if event == "down" else "INFO"
+                )
+                if severity not in ("CRITICAL", "INFO"):
+                    severity = "CRITICAL" if event == "down" else "INFO"
+
+                raw_channels = notification.get("channels")
+                if not isinstance(raw_channels, dict):
+                    # Existing state files only queued email notifications.
+                    channels = {"email": "pending"}
+                else:
+                    channels = {
+                        channel: state_value
+                        for channel in ("email", "telegram")
+                        if (state_value := raw_channels.get(channel)) in ("pending", "sent")
+                    }
+                    for channel in raw_channels:
+                        if channel in ("email", "telegram") and channel not in channels:
+                            channels[channel] = "pending"
+                    if not channels:
+                        channels = {"email": "pending"}
+
                 pending_notifications.append(
                     {
+                        "event_id": event_id[:128],
                         "event": event,
+                        "timestamp": timestamp[:64],
+                        "server": server[:255],
+                        "service": service[:255],
+                        "status": "DOWN" if event == "down" else "RECOVERY",
+                        "severity": severity,
+                        "channels": channels,
                         "result": {
                             "detail": detail[:500],
                             "http_status": status[:16],
@@ -197,7 +245,7 @@ def safe_host(url: str) -> str:
 
 
 def load_notification_settings(path: Path) -> dict[str, str]:
-    """Read simple KEY=VALUE SMTP settings without evaluating shell code."""
+    """Read KEY=VALUE notification settings without evaluating shell code."""
     settings: dict[str, str] = {}
     try:
         with path.open(encoding="utf-8") as settings_file:
@@ -207,25 +255,25 @@ def load_notification_settings(path: Path) -> dict[str, str]:
                     continue
                 if "=" not in line:
                     raise ValueError(
-                        f"Invalid SMTP settings line {line_number}: expected KEY=VALUE"
+                        f"Invalid notification settings line {line_number}: expected KEY=VALUE"
                     )
                 key, value = line.split("=", 1)
                 key = key.strip()
                 value = value.strip()
                 if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
                     raise ValueError(
-                        f"Invalid SMTP settings line {line_number}: invalid variable name"
+                        f"Invalid notification settings line {line_number}: invalid variable name"
                     )
                 if value.startswith(("'", '"')):
                     quote = value[0]
                     if len(value) < 2 or value[-1] != quote:
                         raise ValueError(
-                            f"Invalid SMTP settings line {line_number}: unmatched quote"
+                            f"Invalid notification settings line {line_number}: unmatched quote"
                         )
                     value = value[1:-1]
                 settings[key] = value
     except OSError as exc:
-        raise ValueError(f"Cannot read SMTP settings file {path}: {exc}") from exc
+        raise ValueError(f"Cannot read notification settings file {path}: {exc}") from exc
     return settings
 
 
@@ -262,6 +310,115 @@ def validate_email_settings(settings: Mapping[str, str]) -> dict[str, str | int]
         "EMAIL_FROM": settings["EMAIL_FROM"].strip(),
         "EMAIL_TO": settings["EMAIL_TO"].strip(),
     }
+
+
+def validate_telegram_settings(settings: Mapping[str, str]) -> dict[str, str | int]:
+    """Validate optional direct Bot API or generic workflow webhook settings."""
+    mode = settings.get("TELEGRAM_MODE", "").strip().lower()
+    bot_token = settings.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = settings.get("TELEGRAM_CHAT_ID", "").strip()
+    webhook_url = settings.get("TELEGRAM_WEBHOOK_URL", "").strip()
+    webhook_secret = settings.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+
+    # Keep existing n8n installations working while the public configuration
+    # uses provider-neutral webhook names.
+    legacy_url = settings.get("N8N_WEBHOOK_URL", "").strip()
+    legacy_secret = settings.get("N8N_WEBHOOK_SECRET", "").strip()
+    legacy_configured = bool(legacy_url or legacy_secret)
+    if legacy_configured:
+        if webhook_url or webhook_secret or bot_token or chat_id or mode == "bot_api":
+            raise ValueError("Use either the legacy n8n settings or one Telegram mode, not both")
+        webhook_url = webhook_url or legacy_url
+        webhook_secret = webhook_secret or legacy_secret
+        mode = mode or "webhook"
+
+    if not mode:
+        if bot_token or chat_id:
+            mode = "bot_api"
+        elif webhook_url or webhook_secret:
+            mode = "webhook"
+        else:
+            return {}
+
+    if mode not in {"bot_api", "webhook"}:
+        raise ValueError("TELEGRAM_MODE must be 'bot_api' or 'webhook'")
+
+    timeout_name = "TELEGRAM_TIMEOUT"
+    raw_timeout = settings.get(timeout_name, settings.get("N8N_TIMEOUT", "10")).strip() or "10"
+    try:
+        timeout = int(raw_timeout)
+    except ValueError as exc:
+        raise ValueError("TELEGRAM_TIMEOUT must be an integer") from exc
+    if not 1 <= timeout <= 60:
+        raise ValueError("TELEGRAM_TIMEOUT must be between 1 and 60 seconds")
+
+    if mode == "bot_api":
+        if webhook_url or webhook_secret:
+            raise ValueError("Do not configure webhook values when TELEGRAM_MODE=bot_api")
+        if not bot_token:
+            raise ValueError("TELEGRAM_BOT_TOKEN is required for Telegram Bot API mode")
+        if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", bot_token):
+            raise ValueError("TELEGRAM_BOT_TOKEN has an invalid format")
+        if not chat_id or len(chat_id) > 128 or any(
+            not char.isprintable() or char.isspace() for char in chat_id
+        ):
+            raise ValueError("TELEGRAM_CHAT_ID must be a non-empty chat ID without whitespace")
+        return {
+            "TELEGRAM_MODE": "bot_api",
+            "TELEGRAM_BOT_TOKEN": bot_token,
+            "TELEGRAM_CHAT_ID": chat_id,
+            "TELEGRAM_TIMEOUT": timeout,
+        }
+
+    if bot_token or chat_id:
+        raise ValueError("Do not configure bot token or chat ID when TELEGRAM_MODE=webhook")
+    if not webhook_url:
+        raise ValueError("TELEGRAM_WEBHOOK_URL is required for Telegram webhook mode")
+    if not webhook_secret:
+        raise ValueError("TELEGRAM_WEBHOOK_SECRET is required for Telegram webhook mode")
+    if len(webhook_secret) < 32 or any(
+        not 33 <= ord(char) <= 126 for char in webhook_secret
+    ):
+        raise ValueError(
+            "TELEGRAM_WEBHOOK_SECRET must contain at least 32 printable ASCII characters"
+        )
+
+    try:
+        parsed = urlsplit(webhook_url)
+        valid_url = (
+            parsed.scheme == "https"
+            and bool(parsed.hostname)
+            and not any(char.isspace() or ord(char) < 32 for char in webhook_url)
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.query == ""
+            and parsed.fragment == ""
+            and (parsed.port is None or 1 <= parsed.port <= 65535)
+        )
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise ValueError(
+            "TELEGRAM_WEBHOOK_URL must be a valid HTTPS URL without credentials, query, or fragment"
+        )
+
+    return {
+        "TELEGRAM_MODE": "webhook",
+        "TELEGRAM_WEBHOOK_URL": webhook_url,
+        "TELEGRAM_WEBHOOK_SECRET": webhook_secret,
+        "TELEGRAM_TIMEOUT": timeout,
+    }
+
+
+def validate_notification_settings(settings: Mapping[str, str]) -> dict[str, object]:
+    """Validate configured channels and require at least one notification path."""
+    email_fields = ("EMAIL_FROM", "EMAIL_TO", "SMTP_USERNAME", "SMTP_PASSWORD")
+    email_configured = any(settings.get(key, "").strip() for key in email_fields)
+    email = validate_email_settings(settings) if email_configured else {}
+    telegram = validate_telegram_settings(settings)
+    if not email and not telegram:
+        raise ValueError("Configure at least one notification channel: email or Telegram")
+    return {"email": email, "telegram": telegram}
 
 
 def check_site(site: dict[str, str], timeout: float) -> dict[str, object]:
@@ -391,6 +548,280 @@ def send_email(site_name: str, event: str, result: dict[str, object]) -> None:
             client.send_message(message)
 
 
+class TelegramDeliveryError(Exception):
+    """A sanitized Telegram delivery failure that never exposes credentials."""
+
+
+class WebhookDeliveryError(TelegramDeliveryError):
+    """A workflow-webhook delivery failure."""
+
+
+class _NoRedirectHandler(urllib_request.HTTPRedirectHandler):
+    """Do not forward authentication material to a redirected host."""
+
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+def send_telegram_webhook(
+    notification: dict[str, object], settings: Mapping[str, str | int]
+) -> None:
+    """POST one notification to a workflow using a shared-secret header."""
+    webhook_url = settings.get(
+        "TELEGRAM_WEBHOOK_URL", settings.get("N8N_WEBHOOK_URL", "")
+    )
+    webhook_secret = settings.get(
+        "TELEGRAM_WEBHOOK_SECRET", settings.get("N8N_WEBHOOK_SECRET", "")
+    )
+    timeout = settings.get("TELEGRAM_TIMEOUT", settings.get("N8N_TIMEOUT", 10))
+    try:
+        request = urllib_request.Request(
+            str(webhook_url),
+            data=json.dumps(notification, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-Webhook-Secret": str(webhook_secret),
+            },
+            method="POST",
+        )
+        opener = urllib_request.build_opener(_NoRedirectHandler())
+        with opener.open(request, timeout=int(timeout)) as response:
+            if not 200 <= response.status < 300:
+                raise WebhookDeliveryError(f"Telegram workflow returned HTTP {response.status}")
+            # Consume the bounded response stream before closing the connection.
+            response.read(4096)
+    except urllib_error.HTTPError as exc:
+        status = exc.code
+        exc.close()
+        raise WebhookDeliveryError(f"Telegram workflow returned HTTP {status}") from None
+    except urllib_error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, ssl.SSLError)):
+            description = "connection timed out" if isinstance(reason, TimeoutError) else "TLS connection failed"
+        else:
+            description = "connection failed"
+        raise WebhookDeliveryError(f"Telegram workflow {description}") from None
+    except TimeoutError:
+        raise WebhookDeliveryError("Telegram workflow timed out") from None
+    except (ValueError, UnicodeError):
+        raise WebhookDeliveryError("Telegram workflow request configuration is invalid") from None
+    except OSError:
+        raise WebhookDeliveryError("Telegram workflow connection failed") from None
+
+
+def telegram_message_text(notification: Mapping[str, object]) -> str:
+    """Format a plain-text DOWN or RECOVERY message for the Telegram Bot API."""
+    status = str(notification.get("status", ""))
+    if status == "DOWN":
+        title = "🚨 CRITICAL — Website DOWN"
+    elif status == "RECOVERY":
+        title = "✅ Website RECOVERY"
+    else:
+        raise TelegramDeliveryError("Telegram notification has an invalid status")
+
+    detail = str(notification.get("detail", "Unknown result"))
+    lines = [
+        title,
+        f"Server: {notification.get('server', 'unknown')}",
+        f"Site: {notification.get('service', 'unknown')}",
+        f"Detail: {detail}",
+        f"Time: {notification.get('timestamp', 'unknown')}",
+    ]
+    if notification.get("http_status"):
+        lines.append(f"HTTP status: {notification['http_status']}")
+    if notification.get("redirects", 0):
+        lines.append(f"Redirects: {notification['redirects']}")
+        lines.append(f"Final host: {notification.get('final_host', 'unknown')}")
+    if notification.get("consecutive_failures", 0):
+        lines.append(f"Consecutive failures: {notification['consecutive_failures']}")
+    lines.append(f"Event ID: {notification.get('event_id', 'unknown')}")
+    text = "\n".join(lines)
+    return text if len(text) <= 4096 else f"{text[:4093]}..."
+
+
+def send_telegram_bot_api(
+    notification: dict[str, object], settings: Mapping[str, str | int]
+) -> None:
+    """Send one notification directly to the Telegram Bot API."""
+    token = str(settings["TELEGRAM_BOT_TOKEN"])
+    endpoint = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": settings["TELEGRAM_CHAT_ID"],
+        "text": telegram_message_text(notification),
+    }
+    try:
+        request = urllib_request.Request(
+            endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        opener = urllib_request.build_opener(_NoRedirectHandler())
+        with opener.open(request, timeout=int(settings["TELEGRAM_TIMEOUT"])) as response:
+            if not 200 <= response.status < 300:
+                raise TelegramDeliveryError(
+                    f"Telegram Bot API returned HTTP {response.status}"
+                )
+            try:
+                result = json.loads(response.read(65536))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                raise TelegramDeliveryError(
+                    "Telegram Bot API returned an invalid response"
+                ) from None
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                raise TelegramDeliveryError("Telegram Bot API rejected the message")
+    except urllib_error.HTTPError as exc:
+        status = exc.code
+        exc.close()
+        raise TelegramDeliveryError(
+            f"Telegram Bot API returned HTTP {status}"
+        ) from None
+    except urllib_error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, (TimeoutError, ssl.SSLError)):
+            description = (
+                "connection timed out"
+                if isinstance(reason, TimeoutError)
+                else "TLS connection failed"
+            )
+        else:
+            description = "connection failed"
+        raise TelegramDeliveryError(f"Telegram Bot API {description}") from None
+    except TimeoutError:
+        raise TelegramDeliveryError("Telegram Bot API timed out") from None
+    except (ValueError, UnicodeError):
+        raise TelegramDeliveryError(
+            "Telegram Bot API request configuration is invalid"
+        ) from None
+    except OSError:
+        raise TelegramDeliveryError("Telegram Bot API connection failed") from None
+
+
+def send_telegram_notification(
+    notification: dict[str, object], settings: Mapping[str, str | int]
+) -> None:
+    """Send through the selected direct Bot API or workflow webhook mode."""
+    if settings.get("TELEGRAM_MODE") == "bot_api":
+        send_telegram_bot_api(notification, settings)
+    else:
+        send_telegram_webhook(notification, settings)
+
+
+def make_notification(
+    site_name: str,
+    event: str,
+    result: dict[str, object],
+    channels: dict[str, str],
+) -> dict[str, object]:
+    """Create a durable event with a stable ID and channel-specific statuses."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    server = os.environ.get("MONITOR_SERVER_NAME", "").strip() or socket.gethostname()
+    return {
+        "event_id": str(uuid.uuid4()),
+        "event": event,
+        "timestamp": now,
+        "server": server[:255] or "unknown",
+        "service": site_name,
+        "status": "DOWN" if event == "down" else "RECOVERY",
+        "severity": "CRITICAL" if event == "down" else "INFO",
+        "channels": {channel: "pending" for channel in channels},
+        "result": result,
+    }
+
+
+def notification_payload(notification: dict[str, object]) -> dict[str, object]:
+    """Build the workflow payload while keeping delivery bookkeeping internal."""
+    result = notification["result"]
+    assert isinstance(result, dict)
+    return {
+        "event_id": notification["event_id"],
+        "server": notification["server"],
+        "service": notification["service"],
+        "status": notification["status"],
+        "severity": notification["severity"],
+        "timestamp": notification["timestamp"],
+        "detail": result.get("detail", "Unknown result"),
+        "http_status": result.get("http_status", ""),
+        "redirects": result.get("redirects", 0),
+        "final_host": result.get("final_host", "unknown"),
+        "consecutive_failures": result.get("consecutive_failures", 0),
+    }
+
+
+def deliver_pending_notifications(
+    site_name: str,
+    current: dict[str, object],
+    state: dict[str, dict[str, object]],
+    channels: dict[str, object],
+) -> bool:
+    """Retry each channel in order, without one channel blocking another."""
+    pending = current.get("pending_notifications", [])
+    if not isinstance(pending, list):
+        return False
+
+    senders = {
+        "email": lambda item: send_email(
+            site_name, str(item["event"]), item["result"]
+        ),
+        "telegram": lambda item: send_telegram_notification(
+            notification_payload(item), channels["telegram"]
+        ),
+    }
+    had_error = False
+    for channel_name, sender in senders.items():
+        if not channels.get(channel_name):
+            continue
+        for notification in list(pending):
+            statuses = notification.get("channels")
+            if not isinstance(statuses, dict) or statuses.get(channel_name) != "pending":
+                continue
+            try:
+                sender(notification)
+            except (OSError, ValueError, smtplib.SMTPException, TelegramDeliveryError) as exc:
+                LOGGER.error(
+                    "%s %s notification %s failed: %s",
+                    site_name,
+                    channel_name,
+                    notification.get("event_id", "unknown"),
+                    exc,
+                )
+                had_error = True
+                # Preserve FIFO delivery for this channel, while trying the other channel.
+                break
+
+            statuses[channel_name] = "sent"
+            if notification.get("event") in ("down", "recovery"):
+                current["alerted_down"] = notification["event"] == "down"
+            try:
+                save_state(state)
+            except OSError as exc:
+                LOGGER.error("%s state save failed after %s delivery: %s", site_name, channel_name, exc)
+                had_error = True
+                break
+            LOGGER.info(
+                "%s %s notification %s sent for %s",
+                site_name,
+                channel_name,
+                notification.get("event_id", "unknown"),
+                notification.get("event", "unknown"),
+            )
+
+    remaining = [
+        notification
+        for notification in pending
+        if not isinstance(notification.get("channels"), dict)
+        or any(value != "sent" for value in notification["channels"].values())
+    ]
+    if remaining != pending:
+        current["pending_notifications"] = remaining
+        try:
+            save_state(state)
+        except OSError as exc:
+            LOGGER.error("%s state save failed after queue cleanup: %s", site_name, exc)
+            had_error = True
+    return had_error
+
+
 def transition(
     previous: dict[str, object], healthy: bool, threshold: int
 ) -> tuple[dict[str, object], str | None]:
@@ -433,6 +864,7 @@ def main() -> int:
     try:
         sites, timeout, threshold = load_config()
         state = load_state()
+        channels = validate_notification_settings(os.environ)
     except ValueError as exc:
         LOGGER.error("%s", exc)
         return 2
@@ -463,21 +895,22 @@ def main() -> int:
                 "final_host": final_host,
                 "consecutive_failures": current["consecutive_failures"],
             }
-            pending_notifications.append({"event": event, "result": event_result})
+            configured_channels = {
+                channel_name: "pending"
+                for channel_name in ("email", "telegram")
+                if channels.get(channel_name)
+            }
+            pending_notifications.append(
+                make_notification(site["name"], event, event_result, configured_channels)
+            )
         current["pending_notifications"] = pending_notifications
         state[site["name"]] = current
         try:
             save_state(state)
-            while pending_notifications:
-                notification = pending_notifications[0]
-                notification_event = notification["event"]
-                send_email(site["name"], notification_event, notification["result"])
-                current["alerted_down"] = notification_event == "down"
-                pending_notifications = pending_notifications[1:]
-                current["pending_notifications"] = pending_notifications
-                save_state(state)
-                LOGGER.info("%s email sent for %s", site["name"], notification_event)
-        except (OSError, ValueError, smtplib.SMTPException) as exc:
+            run_error = deliver_pending_notifications(
+                site["name"], current, state, channels
+            ) or run_error
+        except (OSError, ValueError, smtplib.SMTPException, TelegramDeliveryError) as exc:
             LOGGER.error("%s notification/state error: %s", site["name"], exc)
             run_error = True
 

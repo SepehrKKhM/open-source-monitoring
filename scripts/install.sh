@@ -46,7 +46,7 @@ if [[ ! -r "${SOURCE_SITES}" && ! -r "${INSTALLED_SITES}" ]]; then
   exit 1
 fi
 if [[ ! -r "${SOURCE_NOTIFICATIONS}" && ! -r "${INSTALLED_NOTIFICATIONS}" ]]; then
-  echo "Missing SMTP configuration. Create config/notifications.env from config/notifications.env.example, or install it at ${INSTALLED_NOTIFICATIONS}." >&2
+  echo "Missing notification configuration. Create config/notifications.env from config/notifications.env.example, or install it at ${INSTALLED_NOTIFICATIONS}." >&2
   exit 1
 fi
 
@@ -82,9 +82,9 @@ import monitor
 
 try:
     settings = monitor.load_notification_settings(Path(sys.argv[1]))
-    monitor.validate_email_settings(settings)
+    monitor.validate_notification_settings(settings)
 except ValueError as exc:
-    print(f"Invalid SMTP settings: {exc}", file=sys.stderr)
+    print(f"Invalid notification settings: {exc}", file=sys.stderr)
     sys.exit(1)
 PY
 
